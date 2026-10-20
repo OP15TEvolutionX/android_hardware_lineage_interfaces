@@ -9,6 +9,9 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/strings.h>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 
 #define LOG_TAG "vendor.lineage.health-service.default"
@@ -60,6 +63,32 @@ static const std::vector<ChargingLimitNode> kChargingLimitNodes = {
          "/sys/devices/platform/google,charger/charge_stop_level"},
 #endif
 };
+#endif
+
+#ifdef HEALTH_CHARGING_CONTROL_PLC_PATH
+// oplus_chg PLC keeps the adapter feeding the system load with ~0 battery current.
+// The kernel drops it on unplug and after 5 minutes unless it is re-armed.
+static constexpr int kPlcStatusEnable = 3;
+static constexpr auto kPlcKeepAliveInterval = std::chrono::seconds(60);
+static constexpr auto kPlcRetryInterval = std::chrono::seconds(10);
+
+static bool plcSetSwitch(bool enable) {
+    return android::base::WriteStringToFile(
+            enable ? "switch=1|callname=lineage_health" : "switch=0|callname=lineage_health",
+            HEALTH_CHARGING_CONTROL_PLC_PATH, true);
+}
+
+static int plcGetStatus() {
+    std::string content;
+    if (!android::base::ReadFileToString(HEALTH_CHARGING_CONTROL_PLC_PATH, &content, true)) {
+        return -1;
+    }
+    content = android::base::Trim(content);
+    if (!android::base::StartsWith(content, "status=")) {
+        return -1;
+    }
+    return std::atoi(content.c_str() + strlen("status="));
+}
 #endif
 
 #define OPEN_RETRY_COUNT 10
@@ -133,7 +162,50 @@ ChargingControl::ChargingControl()
     }
 #endif
 #endif
+
+#ifdef HEALTH_CHARGING_CONTROL_PLC_PATH
+    mPlcThread = std::thread(&ChargingControl::plcKeepAliveLoop, this);
+#endif
 }
+
+ChargingControl::~ChargingControl() {
+#ifdef HEALTH_CHARGING_CONTROL_PLC_PATH
+    {
+        std::lock_guard<std::mutex> lock(mPlcLock);
+        mPlcStop = true;
+    }
+    mPlcCv.notify_all();
+    mPlcThread.join();
+#endif
+}
+
+#ifdef HEALTH_CHARGING_CONTROL_PLC_PATH
+// Prefer PLC bypass, fall back to plainly disabling charging when the kernel refuses it
+// (unsupported protocol, cable just plugged in, ...).
+bool ChargingControl::applyPlcBypassLocked() {
+    const auto& node = *mChargingEnabledNode;
+    mPlcActive = plcSetSwitch(true) && plcGetStatus() == kPlcStatusEnable;
+    if (mPlcActive) {
+        return android::base::WriteStringToFile(node.value_true, node.path, true);
+    }
+    return android::base::WriteStringToFile(node.value_false, node.path, true);
+}
+
+void ChargingControl::plcKeepAliveLoop() {
+    std::unique_lock<std::mutex> lock(mPlcLock);
+    while (!mPlcStop) {
+        if (!mPlcWanted) {
+            mPlcCv.wait(lock);
+            continue;
+        }
+        if (mPlcCv.wait_for(lock, mPlcActive ? kPlcKeepAliveInterval : kPlcRetryInterval) ==
+                    std::cv_status::timeout &&
+            mPlcWanted && !mPlcStop) {
+            applyPlcBypassLocked();
+        }
+    }
+}
+#endif
 
 #ifdef HEALTH_CHARGING_CONTROL_SUPPORTS_TOGGLE
 ndk::ScopedAStatus ChargingControl::getChargingEnabled(bool* _aidl_return) {
@@ -147,6 +219,13 @@ ndk::ScopedAStatus ChargingControl::getChargingEnabled(bool* _aidl_return) {
 
     if (content == mChargingEnabledNode->value_true) {
         *_aidl_return = true;
+#ifdef HEALTH_CHARGING_CONTROL_PLC_PATH
+        // The kernel turns PLC off with a delay, so only trust its status while we want it.
+        std::lock_guard<std::mutex> lock(mPlcLock);
+        if (mPlcWanted && plcGetStatus() == kPlcStatusEnable) {
+            *_aidl_return = false;
+        }
+#endif
     } else if (content == mChargingEnabledNode->value_false) {
         *_aidl_return = false;
     } else {
@@ -158,6 +237,24 @@ ndk::ScopedAStatus ChargingControl::getChargingEnabled(bool* _aidl_return) {
 }
 
 ndk::ScopedAStatus ChargingControl::setChargingEnabled(bool enabled) {
+#ifdef HEALTH_CHARGING_CONTROL_PLC_PATH
+    {
+        std::lock_guard<std::mutex> lock(mPlcLock);
+        mPlcWanted = !enabled;
+        mPlcCv.notify_all();
+        if (!enabled) {
+            if (!applyPlcBypassLocked()) {
+                LOG(ERROR) << "Failed to enable charging bypass: " << strerror(errno);
+                return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
+            }
+            return ndk::ScopedAStatus::ok();
+        }
+        if (plcGetStatus() == kPlcStatusEnable) {
+            plcSetSwitch(false);
+        }
+        mPlcActive = false;
+    }
+#endif
     const auto& value =
             enabled ? mChargingEnabledNode->value_true : mChargingEnabledNode->value_false;
     if (!android::base::WriteStringToFile(value, mChargingEnabledNode->path, true)) {
@@ -291,6 +388,11 @@ binder_status_t ChargingControl::dump(int fd, const char** /* args */, uint32_t 
     getChargingEnabled(&isChargingEnabled);
     dprintf(fd, "Charging control node selected: %s\n", mChargingEnabledNode->path.c_str());
     dprintf(fd, "Charging enabled: %s\n", isChargingEnabled ? "true" : "false");
+#endif
+
+#ifdef HEALTH_CHARGING_CONTROL_PLC_PATH
+    dprintf(fd, "PLC bypass node: %s, status: %d\n", HEALTH_CHARGING_CONTROL_PLC_PATH,
+            plcGetStatus());
 #endif
 
 #ifdef HEALTH_CHARGING_CONTROL_SUPPORTS_DEADLINE

@@ -11,7 +11,10 @@
 #include <aidl/vendor/lineage/health/ChargingLimitInfo.h>
 #include <android/binder_auto_utils.h>
 #include <android/binder_status.h>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
 
 namespace aidl {
 namespace vendor {
@@ -32,6 +35,7 @@ struct ChargingLimitNode {
 
 struct ChargingControl : public BnChargingControl {
     ChargingControl();
+    ~ChargingControl();
 
     ndk::ScopedAStatus getChargingEnabled(bool* _aidl_return) override;
     ndk::ScopedAStatus setChargingEnabled(bool enabled) override;
@@ -47,6 +51,18 @@ struct ChargingControl : public BnChargingControl {
     [[maybe_unused]] const ChargingEnabledNode* mChargingEnabledNode;
     [[maybe_unused]] const std::string* mChargingDeadlineNode;
     [[maybe_unused]] const ChargingLimitNode* mChargingLimitNode;
+
+#ifdef HEALTH_CHARGING_CONTROL_PLC_PATH
+    bool applyPlcBypassLocked();
+    void plcKeepAliveLoop();
+
+    std::mutex mPlcLock;
+    std::condition_variable mPlcCv;
+    bool mPlcWanted = false;
+    bool mPlcActive = false;
+    bool mPlcStop = false;
+    std::thread mPlcThread;
+#endif
 };
 
 }  // namespace health

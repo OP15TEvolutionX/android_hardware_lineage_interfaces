@@ -62,6 +62,9 @@ cc_binary {
     cflags: select(soong_config_variable("lineage_health", "charging_control_charging_path"), {
         any @ flag_val: ["-DHEALTH_CHARGING_CONTROL_CHARGING_PATH=\"" + flag_val + "\""],
         default: [],
+    }) + select(soong_config_variable("lineage_health", "charging_control_plc_path"), {
+        any @ flag_val: ["-DHEALTH_CHARGING_CONTROL_PLC_PATH=\"" + flag_val + "\""],
+        default: [],
     }) + select(soong_config_variable("lineage_health", "charging_control_deadline_path"), {
         any @ flag_val: ["-DHEALTH_CHARGING_CONTROL_DEADLINE_PATH=\"" + flag_val + "\""],
         default: [],
